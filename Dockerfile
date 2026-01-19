@@ -1,9 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
     wget \
     bzip2 \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libgtk-3-0 \
     libdbus-1-3 \
@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender1 \
     libsm6 \
+    libxcb1 \
+    libxkbcommon0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -q https://github.com/prusa3d/PrusaSlicer/releases/download/version_2.7.1/PrusaSlicer-2.7.1+linux-x64-GTK3-202312140926.tar.bz2 \
