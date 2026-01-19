@@ -2,7 +2,8 @@ FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
     wget \
-    bzip2 \
+    fuse \
+    libfuse2 \
     libgl1 \
     libglib2.0-0 \
     libgtk-3-0 \
@@ -13,13 +14,19 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxcb1 \
     libxkbcommon0 \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-RUN wget -q https://github.com/prusa3d/PrusaSlicer/releases/download/version_2.7.1/PrusaSlicer-2.7.1+linux-x64-GTK3-202312140926.tar.bz2 \
-    && tar -xjf PrusaSlicer-2.7.1+linux-x64-GTK3-202312140926.tar.bz2 \
-    && mv PrusaSlicer-2.7.1+linux-x64-GTK3-202312140926 /opt/prusaslicer \
-    && rm PrusaSlicer-2.7.1+linux-x64-GTK3-202312140926.tar.bz2 \
-    && ln -s /opt/prusaslicer/prusa-slicer /usr/local/bin/prusa-slicer
+# Download PrusaSlicer AppImage
+RUN wget -q --timeout=120 --tries=3 \
+    "https://github.com/prusa3d/PrusaSlicer/releases/download/version_2.7.1/PrusaSlicer-2.7.1+linux-x64-GTK3-202312140926.AppImage" \
+    -O /usr/local/bin/prusa-slicer \
+    && chmod +x /usr/local/bin/prusa-slicer
+
+# Extract AppImage (since FUSE doesn't work in containers)
+RUN cd /opt && /usr/local/bin/prusa-slicer --appimage-extract \
+    && mv squashfs-root prusaslicer \
+    && ln -sf /opt/prusaslicer/AppRun /usr/local/bin/prusa-slicer
 
 WORKDIR /app
 COPY requirements.txt .
