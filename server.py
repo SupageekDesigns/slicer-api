@@ -12,42 +12,53 @@ def parse_gcode_stats(gcode_path):
     stats = {
         "print_time_sec": 0,
         "filament_mm": 0,
-        "filament_grams": 0,
         "layers": 0
     }
     
+    max_e = 0
+    layer_count = 0
+    
     with open(gcode_path, 'r') as f:
-        content = f.read()
-        
-        # Print time
-        match = re.search(r'estimated printing time[^=]*=\s*(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?', content, re.IGNORECASE)
-        if match:
-            d = int(match.group(1) or 0)
-            h = int(match.group(2) or 0)
-            m = int(match.group(3) or 0)
-            s = int(match.group(4) or 0)
-            stats["print_time_sec"] = d * 86400 + h * 3600 + m * 60 + s
-        
-        # Filament mm
-        match = re.search(r'filament used $$mm$$\s*=\s*([\d.]+)', content, re.IGNORECASE)
-        if match:
-            stats["filament_mm"] = float(match.group(1))
-        
-        # Filament grams
-        match = re.search(r'filament used $$g$$\s*=\s*([\d.]+)', content, re.IGNORECASE)
-        if match:
-            stats["filament_grams"] = float(match.group(1))
-        
-        # Layers
-        match = re.search(r'total layers count\s*=\s*(\d+)', content, re.IGNORECASE)
-        if match:
-            stats["layers"] = int(match.group(1))
+        for line in f:
+            # Track max E value for filament
+            if 'E' in line and line.startswith('G1'):
+                match = re.search(r'E([\d.]+)', line)
+                if match:
+                    e_val = float(match.group(1))
+                    if e_val > max_e:
+                        max_e = e_val
+            
+            # Count layers
+            if line.startswith(';LAYER:'):
+                layer_count += 1
+            
+            # CuraEngine time estimate
+            if ';TIME:' in line:
+                match = re.search(r';TIME:(\d+)', line)
+                if match:
+                    stats["print_time_sec"] = int(match.group(1))
+            
+            # Filament used
+            if ';Filament used:' in line:
+                match = re.search(r';Filament used:\s*([\d.]+)m', line)
+                if match:
+                    stats["filament_mm"] = float(match.group(1)) * 1000
+    
+    if stats["filament_mm"] == 0:
+        stats["filament_mm"] = max_e
+    
+    stats["layers"] = layer_count
     
     return stats
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "slicer": "PrusaSlicer 2.7.1"})
+    # Check if CuraEngine is available
+    try:
+        result = subprocess.run(['CuraEngine', '--help'], capture_output=True, timeout=5)
+        return jsonify({"status": "ok", "slicer": "CuraEngine"})
+    except:
+        return jsonify({"status": "error", "message": "CuraEngine not found"}), 500
 
 @app.route('/slice', methods=['POST'])
 def slice_model():
@@ -59,9 +70,9 @@ def slice_model():
         if not file.filename.lower().endswith('.stl'):
             return jsonify({"success": False, "error": "File must be STL"}), 400
         
-        layer_height = request.form.get('layer_height', '0.2')
-        infill = request.form.get('infill', '15')
-        print_speed = request.form.get('print_speed', '150')
+        layer_height = float(request.form.get('layer_height', '0.2'))
+        infill = int(request.form.get('infill', '15'))
+        print_speed = int(request.form.get('print_speed', '150'))
         
         with tempfile.TemporaryDirectory() as tmpdir:
             stl_path = os.path.join(tmpdir, 'model.stl')
@@ -69,24 +80,26 @@ def slice_model():
             
             file.save(stl_path)
             
+            # CuraEngine command
             cmd = [
-                'prusa-slicer',
-                '--export-gcode',
-                '--layer-height', str(layer_height),
-                '--fill-density', f'{infill}%',
-                '--perimeter-speed', str(print_speed),
-                '--infill-speed', str(print_speed),
-                '--travel-speed', '200',
-                '--nozzle-diameter', '0.4',
-                '--filament-diameter', '1.75',
-                '--first-layer-height', '0.2',
-                '--perimeters', '3',
-                '--top-solid-layers', '4',
-                '--bottom-solid-layers', '4',
-                '--bed-shape', '0x0,256x0,256x256,0x256',
-                '--center', '128,128',
-                '--output', gcode_path,
-                stl_path
+                'CuraEngine', 'slice',
+                '-v',
+                '-o', gcode_path,
+                '-s', f'layer_height={layer_height}',
+                '-s', f'infill_sparse_density={infill}',
+                '-s', f'speed_print={print_speed}',
+                '-s', 'wall_thickness=1.2',
+                '-s', 'top_layers=4',
+                '-s', 'bottom_layers=4',
+                '-s', 'infill_pattern=grid',
+                '-s', 'machine_width=256',
+                '-s', 'machine_depth=256',
+                '-s', 'machine_height=256',
+                '-s', 'machine_nozzle_size=0.4',
+                '-s', 'material_diameter=1.75',
+                '-s', 'material_print_temperature=210',
+                '-s', 'material_bed_temperature=60',
+                '-l', stl_path
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -95,21 +108,24 @@ def slice_model():
                 return jsonify({
                     "success": False,
                     "error": "Slicing failed",
-                    "details": result.stderr
+                    "details": result.stderr[:500] if result.stderr else "Unknown error"
                 }), 500
             
             stats = parse_gcode_stats(gcode_path)
             
+            filament_meters = stats["filament_mm"] / 1000
+            filament_grams = filament_meters * 2.98  # PLA density
+            
             return jsonify({
                 "success": True,
                 "print_time_min": round(stats["print_time_sec"] / 60, 1),
-                "filament_meters": round(stats["filament_mm"] / 1000, 2),
-                "filament_grams": round(stats["filament_grams"], 1),
+                "filament_meters": round(filament_meters, 2),
+                "filament_grams": round(filament_grams, 1),
                 "layers": stats["layers"],
                 "settings": {
-                    "layer_height": float(layer_height),
-                    "infill": int(infill),
-                    "print_speed": int(print_speed)
+                    "layer_height": layer_height,
+                    "infill": infill,
+                    "print_speed": print_speed
                 }
             })
     
