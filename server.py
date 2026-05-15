@@ -3,15 +3,18 @@ import tempfile
 import struct
 import smtplib
 import json
+import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.oauth2 import service_account
 
 app = Flask(__name__)
 CORS(app)
 
-# File to store materials (persists on Railway)
 MATERIALS_FILE = "materials.json"
 
 def load_materials():
@@ -33,6 +36,43 @@ def update_materials():
     data = request.get_json()
     save_materials(data)
     return jsonify({"success": True})
+
+def get_drive_service():
+    creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if not creds_json:
+        return None
+    creds_info = json.loads(creds_json)
+    scopes = ['https://www.googleapis.com/auth/drive.file']
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return build('drive', 'v3', credentials=creds)
+
+def get_or_create_folder(service, folder_name, parent_id=None):
+    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get('files', [])
+    if files:
+        return files[0]['id']
+    meta = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder'}
+    if parent_id:
+        meta['parents'] = [parent_id]
+    folder = service.files().create(body=meta, fields='id').execute()
+    return folder['id']
+
+def upload_file_to_drive(service, file_bytes, file_name, folder_id=None):
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        file_meta = {'name': file_name}
+        if folder_id:
+            file_meta['parents'] = [folder_id]
+        media = MediaFileUpload(tmp_path, mimetype='application/octet-stream', resumable=True)
+        result = service.files().create(body=file_meta, media_body=media, fields='id, webViewLink').execute()
+        return result.get('id', ''), result.get('webViewLink', '')
+    finally:
+        os.unlink(tmp_path)
 
 def parse_stl_volume(stl_path):
     with open(stl_path, 'rb') as f:
@@ -108,6 +148,116 @@ def slice_stl():
             return jsonify({"error": str(e)}), 500
         finally:
             os.unlink(tmp.name)
+
+@app.route('/upload-batch', methods=['POST'])
+def upload_batch():
+    data = request.get_json()
+    if not data or 'files' not in data:
+        return jsonify({"error": "No files provided"}), 400
+
+    files = data['files']
+    customer_name = data.get('customerName', 'Unknown')
+    customer_email = data.get('customerEmail', '')
+
+    drive = get_drive_service()
+    root_folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
+
+    uploaded = []
+    folder_id = None
+    folder_link = None
+
+    if drive:
+        subfolder_name = f"{customer_name} - {customer_email}" if customer_email else customer_name
+        folder_id = get_or_create_folder(drive, subfolder_name, root_folder_id)
+        folder_link = f"https://drive.google.com/drive/folders/{folder_id}"
+
+    for f in files:
+        file_name = f.get('fileName', 'upload.stl')
+        file_data_b64 = f.get('fileData', '')
+        try:
+            file_bytes = base64.b64decode(file_data_b64)
+        except Exception:
+            uploaded.append({"fileName": file_name, "fileId": "", "viewLink": ""})
+            continue
+        if drive:
+            try:
+                file_id, view_link = upload_file_to_drive(drive, file_bytes, file_name, folder_id)
+                uploaded.append({"fileName": file_name, "fileId": file_id, "viewLink": view_link})
+            except Exception as e:
+                print(f"Drive upload error for {file_name}: {e}")
+                uploaded.append({"fileName": file_name, "fileId": "", "viewLink": ""})
+        else:
+            uploaded.append({"fileName": file_name, "fileId": "", "viewLink": ""})
+
+    return jsonify({
+        "success": True,
+        "files": uploaded,
+        "folderId": folder_id or "",
+        "folderLink": folder_link or "",
+    })
+
+@app.route('/upload-customer-files', methods=['POST'])
+def upload_customer_files():
+    data = request.get_json()
+    if not data or 'files' not in data:
+        return jsonify({"error": "No files provided"}), 400
+
+    files = data['files']
+    customer_name = data.get('customerName', 'Unknown')
+    customer_email = data.get('customerEmail', '')
+    customer_phone = data.get('customerPhone', '')
+    notes = data.get('notes', '')
+
+    drive = get_drive_service()
+    root_folder_id = os.environ.get('GOOGLE_DRIVE_CUSTOMER_UPLOADS_FOLDER_ID')
+
+    uploaded = []
+    folder_id = None
+    folder_link = None
+
+    if drive:
+        subfolder_name = f"{customer_name} - {customer_email}" if customer_email else customer_name
+        folder_id = get_or_create_folder(drive, subfolder_name, root_folder_id)
+        folder_link = f"https://drive.google.com/drive/folders/{folder_id}"
+
+        if notes or customer_phone:
+            notes_content = f"Customer: {customer_name}\nEmail: {customer_email}\nPhone: {customer_phone}\n\nNotes:\n{notes}"
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w') as tmp:
+                tmp.write(notes_content)
+                tmp_path = tmp.name
+            try:
+                file_meta = {'name': 'notes.txt', 'parents': [folder_id]}
+                media = MediaFileUpload(tmp_path, mimetype='text/plain')
+                drive.files().create(body=file_meta, media_body=media).execute()
+            except Exception as e:
+                print(f"Notes upload error: {e}")
+            finally:
+                os.unlink(tmp_path)
+
+    for f in files:
+        file_name = f.get('fileName', 'upload')
+        file_data_b64 = f.get('fileData', '')
+        try:
+            file_bytes = base64.b64decode(file_data_b64)
+        except Exception:
+            uploaded.append({"fileName": file_name, "fileId": "", "viewLink": ""})
+            continue
+        if drive:
+            try:
+                file_id, view_link = upload_file_to_drive(drive, file_bytes, file_name, folder_id)
+                uploaded.append({"fileName": file_name, "fileId": file_id, "viewLink": view_link})
+            except Exception as e:
+                print(f"Drive upload error for {file_name}: {e}")
+                uploaded.append({"fileName": file_name, "fileId": "", "viewLink": ""})
+        else:
+            uploaded.append({"fileName": file_name, "fileId": "", "viewLink": ""})
+
+    return jsonify({
+        "success": True,
+        "files": uploaded,
+        "folderId": folder_id or "",
+        "folderLink": folder_link or "",
+    })
 
 @app.route('/submit-quote', methods=['POST'])
 def submit_quote():
