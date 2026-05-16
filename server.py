@@ -4,12 +4,13 @@ import struct
 import smtplib
 import json
 import base64
+import io
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 from google.oauth2 import service_account
 
 app = Flask(__name__)
@@ -61,19 +62,13 @@ def get_or_create_folder(service, folder_name, parent_id=None):
     return folder['id']
 
 def upload_file_to_drive(service, file_bytes, file_name, folder_id=None):
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    try:
-        file_meta = {'name': file_name}
-        if folder_id:
-            file_meta['parents'] = [folder_id]
-        resumable = len(file_bytes) > 5 * 1024 * 1024
-        media = MediaFileUpload(tmp_path, mimetype='application/octet-stream', resumable=resumable)
-        result = service.files().create(body=file_meta, media_body=media, fields='id, webViewLink').execute()
-        return result.get('id', ''), result.get('webViewLink', '')
-    finally:
-        os.unlink(tmp_path)
+    file_meta = {'name': file_name}
+    if folder_id:
+        file_meta['parents'] = [folder_id]
+    fh = io.BytesIO(file_bytes)
+    media = MediaIoBaseUpload(fh, mimetype='application/octet-stream', resumable=False)
+    result = service.files().create(body=file_meta, media_body=media, fields='id, webViewLink').execute()
+    return result.get('id', ''), result.get('webViewLink', '')
 
 def parse_stl_volume(stl_path):
     with open(stl_path, 'rb') as f:
@@ -223,17 +218,14 @@ def upload_customer_files():
 
         if notes or customer_phone:
             notes_content = f"Customer: {customer_name}\nEmail: {customer_email}\nPhone: {customer_phone}\n\nNotes:\n{notes}"
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w') as tmp:
-                tmp.write(notes_content)
-                tmp_path = tmp.name
+            notes_bytes = notes_content.encode('utf-8')
             try:
                 file_meta = {'name': 'notes.txt', 'parents': [folder_id]}
-                media = MediaFileUpload(tmp_path, mimetype='text/plain')
+                fh = io.BytesIO(notes_bytes)
+                media = MediaIoBaseUpload(fh, mimetype='text/plain', resumable=False)
                 drive.files().create(body=file_meta, media_body=media).execute()
             except Exception as e:
                 print(f"Notes upload error: {e}")
-            finally:
-                os.unlink(tmp_path)
 
     for f in files:
         file_name = f.get('fileName', 'upload')
