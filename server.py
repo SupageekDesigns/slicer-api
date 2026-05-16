@@ -68,7 +68,8 @@ def upload_file_to_drive(service, file_bytes, file_name, folder_id=None):
         file_meta = {'name': file_name}
         if folder_id:
             file_meta['parents'] = [folder_id]
-        media = MediaFileUpload(tmp_path, mimetype='application/octet-stream', resumable=True)
+        resumable = len(file_bytes) > 5 * 1024 * 1024
+        media = MediaFileUpload(tmp_path, mimetype='application/octet-stream', resumable=resumable)
         result = service.files().create(body=file_meta, media_body=media, fields='id, webViewLink').execute()
         return result.get('id', ''), result.get('webViewLink', '')
     finally:
