@@ -42,7 +42,7 @@ def get_drive_service():
     if not creds_json:
         return None
     creds_info = json.loads(creds_json)
-    scopes = ['https://www.googleapis.com/auth/drive.file']
+    scopes = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
     return build('drive', 'v3', credentials=creds)
 
